@@ -197,6 +197,18 @@ class YoutubeDLHelper:
         return
 
     async def add_download(self, path, qual, playlist, options):
+        if any(domain in self._listener.link for domain in ["stream.pwjarvis", "pwjarvis"]):
+            self.opts.update({
+                "external_downloader": "aria2c",
+                "external_downloader_args": [
+                    "--min-split-size=1M", 
+                    "--max-connection-per-server=16", 
+                    "--max-concurrent-downloads=16", 
+                    "--split=16"
+                ]
+            })
+            LOGGER.info(f"Using aria2 as external downloader for {self._listener.link}")
+        
         if playlist:
             self.opts["ignoreerrors"] = True
             self.is_playlist = True
