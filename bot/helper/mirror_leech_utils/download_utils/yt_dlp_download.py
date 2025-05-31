@@ -4,10 +4,16 @@ from re import search as re_search
 from contextlib import suppress
 from secrets import token_hex
 from yt_dlp import YoutubeDL, DownloadError
+import asyncio
+import re
+from aiofiles.os import path as aiopath
+from asyncio import create_subprocess_shell, subprocess
+
+from bot.helper.ext_utils.files_utils import get_path_size
 
 from .... import task_dict_lock, task_dict
 from ....core.config_manager import BinConfig
-from ...ext_utils.bot_utils import sync_to_async, async_to_sync
+from ...ext_utils.bot_utils import sync_to_async, async_to_sync, cmd_exec
 from ...ext_utils.task_manager import (
     check_running_tasks,
     stop_duplicate_check,
@@ -16,6 +22,7 @@ from ...ext_utils.task_manager import (
 from ...mirror_leech_utils.status_utils.queue_status import QueueStatus
 from ...telegram_helper.message_utils import send_status_message
 from ..status_utils.yt_dlp_status import YtDlpStatus
+from ..status_utils.nm3u8_status import Nm3u8Status
 
 LOGGER = getLogger(__name__)
 
@@ -58,6 +65,7 @@ class YoutubeDLHelper:
         self._ext = ""
         self.is_playlist = False
         self.playlist_count = 0
+        self.is_nm3u8 = False
         self.opts = {
             "progress_hooks": [self._on_download_progress],
             "logger": MyLogger(self, self._listener),
@@ -197,6 +205,52 @@ class YoutubeDLHelper:
         return
 
     async def add_download(self, path, qual, playlist, options):
+        if re.search(r'stream', self._listener.link):
+            self.is_nm3u8 = True
+            self._gid = token_hex(5)
+            
+            if not self._listener.name:
+                url_path = self._listener.link.split('/')[-1]
+                base_name = url_path.split('.')[0]
+                self._listener.name = f"{base_name}.mp4"
+                LOGGER.info(f"Using URL path as name: {self._listener.name}")
+            
+            async with task_dict_lock:
+                task_dict[self._listener.mid] = Nm3u8Status(self._listener, self._gid)
+                
+            await self._listener.on_download_start()
+            if self._listener.multi <= 1:
+                await send_status_message(self._listener.message)
+                
+            msg, button = await stop_duplicate_check(self._listener)
+            if msg:
+                await self._listener.on_download_error(msg, button)
+                return
+
+            if limit_exceeded := await limit_checker(self._listener):
+                await self._listener.on_download_error(limit_exceeded, is_limit=True)
+                return
+                
+            add_to_queue, event = await check_running_tasks(self._listener)
+            if add_to_queue:
+                LOGGER.info(f"Added to Queue/Download: {self._listener.name}")
+                async with task_dict_lock:
+                    task_dict[self._listener.mid] = QueueStatus(
+                        self._listener, self._gid, "dl"
+                    )
+                await event.wait()
+                if self._listener.is_cancelled:
+                    return
+                LOGGER.info(f"Start Queued Download with N_m3u8DL-RE: {self._listener.name}")
+                async with task_dict_lock:
+                    task_dict[self._listener.mid] = Nm3u8Status(self._listener, self._gid)
+            
+            if not add_to_queue:
+                LOGGER.info(f"Download with N_m3u8DL-RE: {self._listener.name}")
+                
+            await self._download_with_nm3u8(path)
+            return
+            
         if playlist:
             self.opts["ignoreerrors"] = True
             self.is_playlist = True
@@ -363,3 +417,52 @@ class YoutubeDLHelper:
                     self.opts[key] = lambda info, ytdl: value
             else:
                 self.opts[key] = value
+
+    async def _download_with_nm3u8(self, path):
+        try:
+            LOGGER.info("Starting nm3u8 download process...")
+        
+            base_name = ospath.splitext(self._listener.name)[0]
+            LOGGER.info(f"Base name for download: {base_name}")
+            
+            cmd = (
+                f'N_m3u8DL-RE "{self._listener.link}" '
+                f'--save-name "{base_name}" '
+                f'--thread-count 32 '
+                f'--save-dir "{path}" '
+                f'--live-pipe-mux '
+                f'--concurrent-download '
+                f'--ffmpeg-binary-path /bin/{BinConfig.FFMPEG_NAME}'
+            )
+            
+            LOGGER.info(f"Starting N_m3u8DL-RE download: {cmd}")
+                 
+            process = await asyncio.create_subprocess_shell(cmd)
+            await process.communicate()
+        
+            if self._listener.is_cancelled:
+                return
+                
+            expected_file = f"{path}/{base_name}.mp4"
+            if not await aiopath.exists(expected_file):
+                for ext in ['.ts', '.mkv', '.m4a']:
+                    alt_file = f"{path}/{base_name}{ext}"
+                    if await aiopath.exists(alt_file):
+                        expected_file = alt_file
+                        self._listener.name = f"{base_name}{ext}"
+                        break
+                else:
+                    LOGGER.error(f"N_m3u8DL-RE download failed: File not found at {expected_file}")
+                    await self._listener.on_download_error("Download failed: Output file not found")
+                    return
+            else:
+                self._listener.name = f"{base_name}.mp4"
+            
+            self._listener.size = await get_path_size(expected_file)
+            
+            LOGGER.info(f"N_m3u8DL-RE download completed: {self._listener.name}")
+            await self._listener.on_download_complete()
+            
+        except Exception as e:
+            LOGGER.error(f"Error in N_m3u8DL-RE download: {str(e)}")
+            await self._listener.on_download_error(f"Download error: {str(e)}")
